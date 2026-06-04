@@ -142,12 +142,18 @@ python3 resonance_handshake.py --threshold 0.6
 |---|---|---|
 | `--timeout SECONDS` | `600.0` | Maximum wait per LLM call, in seconds. Often too short for large models running on CPU or low-end hardware. |
 | `--max-tokens-binary N` | `512` | Token budget for the Yes/No stage. Thinking models (Gemma 4, Qwen 3 thinking, etc.) need more, because their internal reasoning consumes output token budget. |
+| `--num-ctx N` | *(model default)* | Ollama context window size in tokens. Critical when the manifest exceeds the model's default context. The manifest is ~7,000 tokens; add system prompt and response budget, and some models (e.g. DeepSeek-R1:8b with a 4,096-token default) silently truncate or return empty answers without this flag. Set to `32768` on hardware with ≥16 GB VRAM. |
+| `--research-mode` | *(off)* | Continue with Stage 2 MC questions even when Stage 1b returns `Nein`. The `approved` field stays `False` — this mode collects diagnostic data only, it does not change the handshake result. Useful for understanding *why* a model rejects the manifest. |
 
 **Practical background:**
 
 The 10-minute default timeout is enough for most models up to ~13B parameters on a modern workstation. On a standard laptop without a GPU, or with limited VRAM, Stage 1a alone (open evaluation of the 21k-character manifest) can run longer. If the run aborts with `Timeout for model X`, this is the dial to turn.
 
 The default `--max-tokens-binary 512` is sized for non-thinking models. Gemma 4 and similar thinking models spend a large portion of that budget inside an internal `thinking` field before the actual answer begins — if the model returns after a long pause with an empty or truncated answer, this is the cause.
+
+**`--num-ctx`** addresses a different problem: the context window. The manifest is approximately 7,000 tokens. Some models have a small default context (DeepSeek-R1:8b defaults to 4,096 tokens). When the manifest plus system prompt exceeds that limit, Ollama silently truncates the input — the model never reads the full text and returns an empty or incoherent answer. This is not a timeout; it produces a `manifest_response: ""` in the result JSON. If you see that pattern, `--num-ctx 32768` (or higher) fixes it. On hardware with 16 GB or more VRAM, 32,768 tokens is safe for all models in the standard test suite.
+
+**`--research-mode`** keeps the test running after a `Nein` in Stage 1b. Without it, the script stops at the gate. With it, Stage 2 MC questions are asked anyway and the answers are stored in the JSON. The `approved` field is always `False` for a `Nein` model regardless of the MC score — research mode does not lower the bar, it adds a diagnostic layer beneath it.
 
 **Examples:**
 
@@ -157,6 +163,12 @@ python3 resonance_handshake.py --timeout 1800 --max-tokens-binary 2048
 
 # Thinking model on a well-equipped machine
 python3 resonance_handshake.py --model gemma4:latest --max-tokens-binary 2048
+
+# DeepSeek-R1 or Gemma4 with explicit context window (fixes empty manifest_response)
+python3 resonance_handshake.py --model deepseek-r1:8b --num-ctx 32768 --max-tokens-binary 4096 --timeout 1800
+
+# Research run on a rejecting model — collect MC data despite Nein
+python3 resonance_handshake.py --model gemma4:latest --num-ctx 32768 --research-mode --timeout 1800
 ```
 
 ## Manifest Source and Privacy
