@@ -1,5 +1,5 @@
 """
-ResonanceHandshake — Manifest-Anchored Communication Protocol v0.4
+ResonanceHandshake — Manifest-Anchored Communication Protocol v0.4.2
 ===================================================================
 Three-stage manifest verification for any LLM on Ollama.
 
@@ -23,6 +23,15 @@ Design rationale:
 - Ollama native API (/api/chat) required for thinking models.
   The OpenAI-compatible API silently drops the 'thinking' field.
 - All responses stored as JSON for research analysis.
+
+v0.4.2 changelog:
+- Add: --num-ctx flag (Ollama context window, critical for large manifests on small-default models)
+- Fix: call_llm() propagates num_ctx to all three stages (1a, 1b, MC)
+- Fix: select_questions(standard) gap when num % 3 != 0
+- Fix: DeepSeek-R1 thinking-fallback (_extract_answer_from_thinking, incl. English patterns)
+- Fix: call_llm() reads content/thinking separately, fallback on empty content
+- Add: --research-mode flag (MC even on Nein, approved stays False)
+- Add: research_mode field in result JSON
 
 v0.4 changelog:
 - Renamed from CoEvolHandshake to ResonanceHandshake
@@ -183,6 +192,7 @@ class HandshakeResult:
     llm_name: str
     timestamp: str = ""
     approved: bool = False
+    research_mode: bool = False
     manifest_response: str = ""
     manifest_agreed: bool = False
     manifest_hash: str = ""
@@ -203,11 +213,46 @@ class HandshakeResult:
 
 # ── LLM Client ──────────────────────────────────────────
 
-async def call_llm(prompt, model, ollama_url, http_client, temperature=0.0, max_tokens=1024):
+def _extract_answer_from_thinking(thinking_text: str) -> str:
+    """Fallback für Modelle die Antwort im thinking-Block statt content platzieren."""
+    if not thinking_text:
+        return ""
+    lines = [l.strip() for l in thinking_text.splitlines() if l.strip()]
+    if not lines:
+        return ""
+    last_yes = last_no = None
+    for i, line in enumerate(lines):
+        t = line.lower()
+        if t in ("ja", "ja.", "yes", "yes."):
+            last_yes = i
+        elif t in ("nein", "nein.", "no", "no."):
+            last_no = i
+        elif t.startswith("ja") and len(t) < 25:
+            last_yes = i
+        elif t.startswith("nein") and len(t) < 25:
+            last_no = i
+    if last_yes is not None and last_no is not None:
+        return "Ja." if last_yes > last_no else "Nein."
+    if last_yes is not None:
+        return "Ja."
+    if last_no is not None:
+        return "Nein."
+    tail = " ".join(lines[-3:]).lower()
+    if any(w in tail for w in ("stimme zu", "akzeptiere", " ja ", "absolutely", "accept")):
+        return "Ja."
+    if any(w in tail for w in ("stimme nicht", "ablehnen", " nein ", "cannot accept")):
+        return "Nein."
+    return ""
+
+
+async def call_llm(prompt, model, ollama_url, http_client, temperature=0.0, max_tokens=1024, num_ctx=None):
     """Call LLM via Ollama native API (/api/chat)."""
     url = f"{ollama_url.rstrip('/')}/api/chat"
+    options = {"temperature": temperature, "num_predict": max_tokens}
+    if num_ctx:
+        options["num_ctx"] = num_ctx  # Explizites Kontextfenster (wichtig für Modelle mit kleinem Default)
     payload = {"model": model, "messages": [{"role": "user", "content": prompt}],
-               "stream": False, "options": {"temperature": temperature, "num_predict": max_tokens}}
+               "stream": False, "options": options}
     try:
         response = await http_client.post(url, json=payload)
         response.raise_for_status()
@@ -217,7 +262,15 @@ async def call_llm(prompt, model, ollama_url, http_client, temperature=0.0, max_
                  "completion_tokens": data.get("eval_count"),
                  "total_duration_s": round(data.get("total_duration", 0) / 1e9, 1),
                  "thinking_length": len(msg.get("thinking", ""))}
-        return LLMResponse(content=msg.get("content", "").strip(), model=data.get("model", model), usage=usage)
+        content  = msg.get("content", "").strip()
+        thinking = msg.get("thinking", "").strip()
+        # FIX: DeepSeek-R1 und ähnliche können Antwort im thinking-Block platzieren
+        if not content and thinking:
+            extracted = _extract_answer_from_thinking(thinking)
+            if extracted:
+                print(f"  [thinking-fallback] Antwort aus thinking-Block: {repr(extracted)}")
+                content = extracted
+        return LLMResponse(content=content, model=data.get("model", model), usage=usage)
     except httpx.TimeoutException:
         raise LLMError(f"Timeout for model {model}")
     except httpx.HTTPStatusError as e:
@@ -367,11 +420,20 @@ def select_questions(questions, num=6, mix="standard"):
         sel = (random.sample(by_diff["basic"], n_basic)
                + random.sample(by_diff["intermediate"], n_inter)
                + random.sample(by_diff["advanced"], n_adv))
-    else:
+    else:  # standard
         n = num // 3
-        sel = (random.sample(by_diff["basic"], min(n, len(by_diff["basic"])))
-               + random.sample(by_diff["intermediate"], min(n, len(by_diff["intermediate"])))
-               + random.sample(by_diff["advanced"], min(n, len(by_diff["advanced"]))))
+        n_basic = min(n, len(by_diff["basic"]))
+        n_inter = min(n, len(by_diff["intermediate"]))
+        n_adv   = min(n, len(by_diff["advanced"]))
+        sel = (random.sample(by_diff["basic"], n_basic)
+               + random.sample(by_diff["intermediate"], n_inter)
+               + random.sample(by_diff["advanced"], n_adv))
+        gap = num - len(sel)
+        if gap > 0:
+            used_ids = {q["id"] for q in sel}
+            rest = [q for q in questions if q["id"] not in used_ids]
+            random.shuffle(rest)
+            sel += rest[:gap]
     random.shuffle(sel)
     selected = sel[:num]
     if len(selected) < num:
@@ -482,7 +544,8 @@ async def run_handshake(args):
         print("=" * 70)
 
         result = HandshakeResult(llm_name=llm_name, num_questions=args.num_questions,
-                                 pass_threshold=args.threshold, difficulty_mix=args.difficulty)
+                                 pass_threshold=args.threshold, difficulty_mix=args.difficulty,
+                                 research_mode=args.research_mode)
         manifest, manifest_hash, used_fallback = load_manifest(args.allow_fallback)
         result.manifest_hash = manifest_hash
         result.used_fallback = used_fallback
@@ -494,7 +557,7 @@ async def run_handshake(args):
         print(f"  Sending manifest ({len(manifest)} chars)...")
         start = time.time()
         try:
-            resp1a = await call_llm(build_open_prompt(manifest), model, ollama_url, client, max_tokens=DEFAULT_MAX_TOKENS_OPEN)
+            resp1a = await call_llm(build_open_prompt(manifest), model, ollama_url, client, max_tokens=DEFAULT_MAX_TOKENS_OPEN, num_ctx=args.num_ctx)
             dur = time.time() - start
             u = resp1a.usage or {}
             result.open_evaluation = resp1a.content
@@ -513,7 +576,7 @@ async def run_handshake(args):
         print(f"  Sending manifest ({len(manifest)} chars)...")
         start = time.time()
         try:
-            resp1b = await call_llm(build_manifest_prompt(manifest), model, ollama_url, client, max_tokens=args.max_tokens_binary)
+            resp1b = await call_llm(build_manifest_prompt(manifest), model, ollama_url, client, max_tokens=args.max_tokens_binary, num_ctx=args.num_ctx)
             dur = time.time() - start
             u = resp1b.usage or {}
             result.manifest_response = resp1b.content
@@ -531,10 +594,14 @@ async def run_handshake(args):
             result.manifest_agreed = False
 
         if not result.manifest_agreed:
-            print("\n  ══ HANDSHAKE STOPPED: Manifest not agreed ══")
-            print("  Check open_evaluation in the JSON output.")
-            save_and_show(result)
-            return result
+            if not args.research_mode:
+                print("\n  ══ HANDSHAKE STOPPED: Manifest not agreed ══")
+                print("  Check open_evaluation in the JSON output.")
+                save_and_show(result)
+                return result
+            else:
+                print("\n  ══ HANDSHAKE: Manifest not agreed — RESEARCH MODE continues ══")
+                print("  MC questions will be asked for research data (not counted toward approval).")
 
         # ── Stage 2: MC Questions ───────────────────────
         print(f"\n─── Stage 2: Diagnostic ({args.num_questions} questions) ───")
@@ -550,7 +617,7 @@ async def run_handshake(args):
             resp = None
             start = time.time()
             try:
-                resp = await call_llm(build_mc_prompt(q), model, ollama_url, client, max_tokens=DEFAULT_MAX_TOKENS_MC)
+                resp = await call_llm(build_mc_prompt(q), model, ollama_url, client, max_tokens=DEFAULT_MAX_TOKENS_MC, num_ctx=args.num_ctx)
                 qd = time.time() - start
                 mc_time += qd
                 answer_id = parse_mc_response(resp.content)
@@ -583,6 +650,8 @@ async def run_handshake(args):
         result.mc_passed = result.mc_score >= args.threshold
         result.diagnostic_profile = build_diagnostic_profile(evaluations)
         result.approved = result.manifest_agreed and result.mc_passed
+        if args.research_mode and not result.manifest_agreed:
+            print(f"\n  [research] MC completed despite Nein — approved stays False")
 
     save_and_show(result, mc_time)
     return result
@@ -632,6 +701,11 @@ def main():
                     help="Increase for thinking models (e.g. 2048 for Gemma 4)")
     p.add_argument("--allow-fallback", action="store_true",
                     help="Run with built-in fallback if manifest file not found")
+    p.add_argument("--research-mode", action="store_true",
+                    help="Continue with MC questions even if model says Nein (data collection only, approved stays False)")
+    p.add_argument("--num-ctx", type=int, default=None,
+                    help="Ollama context window size (num_ctx). Default: model default. "
+                         "Set explicitly when manifest is large (e.g. 32768 for DeepSeek-R1/Gemma4 with 7k-token manifest).")
     args = p.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     logging.getLogger("httpx").setLevel(logging.WARNING)
